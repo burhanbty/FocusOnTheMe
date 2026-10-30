@@ -1,0 +1,37 @@
+# Sanal ortam ve paketler
+.venv/
+venv/
+env/
+ENV/
+
+# Python önbellekleri ve test çıktıları
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Yerel kullanıcı verileri, veritabanı, ekran görüntüleri ve loglar (Kişisel veriler)
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+state_snapshot.json
+proofs/
+
+# PyInstaller / derleme çıktıları
+build/
+dist/
+
+# Ortam değişkenleri ve IDE dosyaları
+.env
+.env.*
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
