@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
-from app.config import DB_PATH, DEFAULT_ALLOWED_URLS, ensure_data_dirs
+from app.config import DB_PATH, DEFAULT_ALLOWED_URLS, DEFAULT_COURSES, ensure_data_dirs
 from app.core.logical_date import calculate_streak, get_logical_date
 
 
@@ -27,8 +27,6 @@ class Database:
     def connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(str(self.db_path), timeout=10.0)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
         try:
             yield conn
             conn.commit()
@@ -40,6 +38,8 @@ class Database:
 
     def _init_schema(self) -> None:
         with self.connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA foreign_keys=ON;")
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS tasks (
@@ -99,6 +99,27 @@ class Database:
                     event_type TEXT NOT NULL,
                     details TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS courses (
+                    code TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    sort_order INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS course_study_logs (
+                    logical_date TEXT NOT NULL,
+                    course_code TEXT NOT NULL,
+                    active_seconds INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (logical_date, course_code)
+                );
+
+                CREATE TABLE IF NOT EXISTS app_usage_logs (
+                    logical_date TEXT NOT NULL,
+                    exe_name TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    active_seconds INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (logical_date, exe_name)
+                );
                 """
             )
 
@@ -110,6 +131,14 @@ class Database:
                     conn.execute(
                         "INSERT OR IGNORE INTO allowed_urls (url_pattern, enabled) VALUES (?, 1)",
                         (url,),
+                    )
+
+            course_count = conn.execute("SELECT COUNT(*) FROM courses").fetchone()[0]
+            if course_count == 0:
+                for idx, (code, name) in enumerate(DEFAULT_COURSES, start=1):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO courses (code, name, sort_order) VALUES (?, ?, ?)",
+                        (code, name, idx),
                     )
 
             app_count = conn.execute("SELECT COUNT(*) FROM allowed_apps").fetchone()[0]
@@ -127,9 +156,11 @@ class Database:
                         break
 
             # Varsayılan ayarlar
+            default_course_code = DEFAULT_COURSES[0][0] if DEFAULT_COURSES else "CENG101"
             default_settings = {
                 "require_screenshot_proof": "0",
                 "study_folder_path": "",
+                "active_course_code": default_course_code,
                 "emergency_failed_attempts": "0",
                 "emergency_lockout_until": "0",
             }
@@ -435,3 +466,182 @@ class Database:
                 (limit,),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Dersler, Ders Çalışma Süreleri ve Uygulama Kullanım Süreleri
+    # ------------------------------------------------------------------
+    def get_courses(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT code, name, sort_order FROM courses ORDER BY sort_order ASC, code ASC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def add_course(self, code: str, name: str) -> None:
+        clean_code = code.strip().upper()
+        clean_name = name.strip()
+        if not clean_code:
+            return
+        if not clean_name:
+            clean_name = clean_code
+        with self.connect() as conn:
+            max_order = conn.execute("SELECT COALESCE(MAX(sort_order), 0) FROM courses").fetchone()[0]
+            conn.execute(
+                """
+                INSERT INTO courses (code, name, sort_order)
+                VALUES (?, ?, ?)
+                ON CONFLICT(code) DO UPDATE SET name = excluded.name
+                """,
+                (clean_code, clean_name, max_order + 1),
+            )
+
+    def get_active_course(self) -> str:
+        default_code = DEFAULT_COURSES[0][0] if DEFAULT_COURSES else "CENG101"
+        val = self.get_setting("active_course_code", default_code).strip()
+        return val or default_code
+
+    def set_active_course(self, course_code: str) -> None:
+        cleaned = course_code.strip()
+        if cleaned:
+            self.set_setting("active_course_code", cleaned)
+
+    def increment_course_study_seconds(
+        self,
+        course_code: str,
+        seconds: int = 1,
+        logical_date: str | None = None,
+    ) -> None:
+        code = (course_code or "").strip() or self.get_active_course()
+        ldate = logical_date or get_logical_date()
+        delta = max(0, int(seconds))
+        if delta <= 0:
+            return
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO course_study_logs (logical_date, course_code, active_seconds)
+                VALUES (?, ?, ?)
+                ON CONFLICT(logical_date, course_code) DO UPDATE SET
+                    active_seconds = course_study_logs.active_seconds + excluded.active_seconds
+                """,
+                (ldate, code, delta),
+            )
+
+    def get_course_study_seconds(
+        self,
+        course_code: str,
+        logical_date: str | None = None,
+    ) -> int:
+        code = (course_code or "").strip() or self.get_active_course()
+        ldate = logical_date or get_logical_date()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT active_seconds FROM course_study_logs WHERE logical_date = ? AND course_code = ?",
+                (ldate, code),
+            ).fetchone()
+            return int(row["active_seconds"]) if row else 0
+
+    def get_course_study_stats(self, logical_date: str | None = None) -> list[dict[str, Any]]:
+        ldate = logical_date or get_logical_date()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    l.course_code,
+                    COALESCE(c.name, l.course_code) AS course_name,
+                    l.active_seconds
+                FROM course_study_logs l
+                LEFT JOIN courses c ON c.code = l.course_code
+                WHERE l.logical_date = ? AND l.active_seconds > 0
+                ORDER BY l.active_seconds DESC, l.course_code ASC
+                """,
+                (ldate,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def increment_app_usage_seconds(
+        self,
+        exe_name: str,
+        display_name: str,
+        seconds: int = 1,
+        logical_date: str | None = None,
+    ) -> None:
+        norm_exe = (exe_name or "").strip().lower()
+        if not norm_exe:
+            return
+        disp = (display_name or "").strip() or norm_exe
+        ldate = logical_date or get_logical_date()
+        delta = max(0, int(seconds))
+        if delta <= 0:
+            return
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO app_usage_logs (logical_date, exe_name, display_name, active_seconds)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(logical_date, exe_name) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    active_seconds = app_usage_logs.active_seconds + excluded.active_seconds
+                """,
+                (ldate, norm_exe, disp, delta),
+            )
+
+    def get_app_usage_stats(self, logical_date: str | None = None) -> list[dict[str, Any]]:
+        ldate = logical_date or get_logical_date()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT exe_name, display_name, active_seconds
+                FROM app_usage_logs
+                WHERE logical_date = ? AND active_seconds > 0
+                ORDER BY active_seconds DESC, display_name ASC
+                """,
+                (ldate,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def record_active_tick(
+        self,
+        logical_date: str,
+        course_code: str,
+        is_active: bool,
+        app_exe: str | None = None,
+        app_display: str | None = None,
+    ) -> int:
+        """1 saniyelik döngüde tüm süre güncellemelerini TEK bir SQLite işleminde yapar
+        ve seçili dersin güncel toplam saniyesini döndürür.
+        """
+        code = (course_code or "").strip() or "CENG101"
+        with self.connect() as conn:
+            if is_active:
+                conn.execute(
+                    "UPDATE daily_sessions SET focus_seconds = focus_seconds + 1 WHERE logical_date = ?",
+                    (logical_date,),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO course_study_logs (logical_date, course_code, active_seconds)
+                    VALUES (?, ?, 1)
+                    ON CONFLICT(logical_date, course_code) DO UPDATE SET
+                        active_seconds = course_study_logs.active_seconds + 1
+                    """,
+                    (logical_date, code),
+                )
+                if app_exe:
+                    norm_exe = app_exe.strip().lower()
+                    disp = (app_display or "").strip() or norm_exe
+                    conn.execute(
+                        """
+                        INSERT INTO app_usage_logs (logical_date, exe_name, display_name, active_seconds)
+                        VALUES (?, ?, ?, 1)
+                        ON CONFLICT(logical_date, exe_name) DO UPDATE SET
+                            display_name = excluded.display_name,
+                            active_seconds = app_usage_logs.active_seconds + 1
+                        """,
+                        (logical_date, norm_exe, disp),
+                    )
+            row = conn.execute(
+                "SELECT active_seconds FROM course_study_logs WHERE logical_date = ? AND course_code = ?",
+                (logical_date, code),
+            ).fetchone()
+            return int(row["active_seconds"]) if row else 0

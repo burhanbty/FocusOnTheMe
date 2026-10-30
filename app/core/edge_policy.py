@@ -10,6 +10,7 @@ from app.config import (
     EDGE_ALLOWLIST_REG_PATH,
     EDGE_BLOCKLIST_REG_PATH,
     EDGE_POLICY_REG_PATH,
+    EDGE_REQUIRED_LOCAL_SCHEMES,
 )
 
 HIVES: tuple[tuple[str, int], ...] = (
@@ -50,8 +51,21 @@ def _delete_key_tree_values(root_hive: int, subkey_path: str) -> None:
 
 
 def apply_edge_policies(allowed_urls: Iterable[str] | None = None) -> dict[str, Any]:
-    """Edge URLBlocklist, URLAllowlist, InPrivate ve Guest modu kısıtlarını hem HKCU hem HKLM'ye yazar."""
-    urls = [u.strip() for u in (allowed_urls if allowed_urls is not None else DEFAULT_ALLOWED_URLS) if u.strip()]
+    """Edge URLBlocklist, URLAllowlist, InPrivate ve Guest modu kısıtlarını hem HKCU hem HKLM'ye yazar.
+
+    Yerel PDF ve ders klasörü dosyalarının Edge ile sorunsuz açılabilmesi için
+    `file://*`, `edge://*` ve `chrome-extension://*` şemaları otomatik olarak
+    URLAllowlist listesine dahil edilir.
+    """
+    raw_urls = list(allowed_urls) if allowed_urls is not None else list(DEFAULT_ALLOWED_URLS)
+    urls: list[str] = []
+    seen: set[str] = set()
+    for item in [*EDGE_REQUIRED_LOCAL_SCHEMES, *raw_urls]:
+        cleaned = item.strip()
+        if cleaned and cleaned.lower() not in seen:
+            seen.add(cleaned.lower())
+            urls.append(cleaned)
+
     result: dict[str, Any] = {"hkcu": False, "hklm": False, "errors": []}
 
     for hive_name, hive_root in HIVES:

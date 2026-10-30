@@ -203,3 +203,157 @@ def test_morning_setup_requires_at_least_one_task(tmp_path: Path) -> None:
 
     assert win.start_btn.isEnabled() is True
     win.close()
+
+
+def test_study_folder_subfolder_navigation(tmp_path: Path) -> None:
+    """Ders Klasörü panelinde alt klasörlerin göründüğünü, içine girilebildiğini ve üst klasöre dönülebildiğini doğrular."""
+    from PySide6.QtWidgets import QApplication
+    from app.ui.task_popover import StudyFolderPopover
+
+    app = QApplication.instance() or QApplication([])
+    root_dir = tmp_path / "DersKlasoru"
+    sub_dir = root_dir / "CENG201" / "Hafta3"
+    sub_dir.mkdir(parents=True)
+    (root_dir / "Syllabus.pdf").write_text("pdf1", encoding="utf-8")
+    (sub_dir / "OOP_Notes.pdf").write_text("pdf2", encoding="utf-8")
+
+    pop = StudyFolderPopover()
+    pop.load_folder(str(root_dir))
+    app.processEvents()
+
+    # Kök dizinde CENG201 klasörü ve Syllabus.pdf dosyası görünmeli
+    root_texts = [pop.file_list.item(i).text() for i in range(pop.file_list.count())]
+    assert any("CENG201" in t and "📁" in t for t in root_texts)
+    assert any("Syllabus.pdf" in t and "📄" in t for t in root_texts)
+
+    # CENG201 klasörüne tıkla -> içine girmeli
+    folder_item = next(
+        pop.file_list.item(i)
+        for i in range(pop.file_list.count())
+        if "CENG201" in pop.file_list.item(i).text()
+    )
+    pop._on_item_clicked(folder_item)
+    app.processEvents()
+
+    sub_texts = [pop.file_list.item(i).text() for i in range(pop.file_list.count())]
+    assert any("Üst Klasöre Dön" in t for t in sub_texts)
+    assert any("Hafta3" in t and "📁" in t for t in sub_texts)
+
+    # Hafta3 alt klasörüne gir -> OOP_Notes.pdf görünmeli
+    week_item = next(
+        pop.file_list.item(i)
+        for i in range(pop.file_list.count())
+        if "Hafta3" in pop.file_list.item(i).text()
+    )
+    pop._on_item_clicked(week_item)
+    app.processEvents()
+
+    week_texts = [pop.file_list.item(i).text() for i in range(pop.file_list.count())]
+    assert any("OOP_Notes.pdf" in t for t in week_texts)
+
+    # Üst klasöre dön (..) tıkla -> tekrar CENG201 seviyesine dönmeli
+    up_item = pop.file_list.item(0)
+    pop._on_item_clicked(up_item)
+    app.processEvents()
+    back_texts = [pop.file_list.item(i).text() for i in range(pop.file_list.count())]
+    assert any("Hafta3" in t for t in back_texts)
+    pop.close()
+
+
+def test_screenshot_proof_dialog_captures_and_saves(tmp_path: Path, monkeypatch) -> None:
+    """Ekran görüntüsü kanıt diyaloğunun görüntüyü yakalayıp onaylandığında dosyaya kaydettiğini doğrular."""
+    from PySide6.QtWidgets import QApplication
+    from app.ui.proof_dialog import ScreenshotProofDialog
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(config, "PROOFS_DIR", tmp_path / "proofs")
+
+    dlg = ScreenshotProofDialog()
+    confirmed_results: list[tuple[int, str]] = []
+    dlg.proof_confirmed.connect(lambda tid, path: confirmed_results.append((tid, path)))
+
+    sample_task = {"id": 42, "subject": "CENG201", "title": "Lab ödevi"}
+    dlg.start_capture_for_task(sample_task, logical_date="2026-10-30")
+    app.processEvents()
+
+    assert dlg.isVisible() is True
+    dlg._on_confirm_clicked()
+    app.processEvents()
+
+    assert len(confirmed_results) == 1
+    tid, saved_path = confirmed_results[0]
+    assert tid == 42
+    assert Path(saved_path).exists()
+    dlg.close()
+
+
+def test_courses_idle_threshold_and_app_usage_tracking(tmp_path: Path) -> None:
+    """10 ön tanımlı dersi, 2 dk (120 sn) boşta kalma eşiğini ve ders/uygulama süre takibini doğrular."""
+    from PySide6.QtWidgets import QApplication
+    from app.core.activity_tracker import is_user_actively_working
+    from app.core.database import Database
+    from app.ui.top_bar import TopBarWindow
+
+    # Eşik 2 dakika (120 saniye) olmalı
+    assert config.IDLE_THRESHOLD_SECONDS == 120
+    assert is_user_actively_working(120, idle_seconds_override=45.0) is True
+    assert is_user_actively_working(120, idle_seconds_override=119.9) is True
+    assert is_user_actively_working(120, idle_seconds_override=120.0) is False
+    assert is_user_actively_working(120, idle_seconds_override=300.0) is False
+
+    db = Database(tmp_path / "courses_test.db")
+    courses = db.get_courses()
+    codes = [c["code"] for c in courses]
+    for expected in ("CENG101", "CENG113", "CENG201", "CENG203", "CENG207", "CENG209", "ENGR227", "ENGR265", "MATH101", "MATH201"):
+        assert expected in codes
+
+    ldate = "2026-10-30"
+    db.set_active_course("CENG201")
+    assert db.get_active_course() == "CENG201"
+
+    db.increment_course_study_seconds("CENG201", 125, logical_date=ldate)
+    db.increment_app_usage_seconds("msedge.exe", "Microsoft Edge", 90, logical_date=ldate)
+    db.increment_app_usage_seconds("sumatrapdf.exe", "SumatraPDF", 35, logical_date=ldate)
+
+    c_stats = db.get_course_study_stats(ldate)
+    assert len(c_stats) == 1
+    assert c_stats[0]["course_code"] == "CENG201"
+    assert c_stats[0]["active_seconds"] == 125
+
+    a_stats = db.get_app_usage_stats(ldate)
+    assert len(a_stats) == 2
+    assert a_stats[0]["display_name"] == "Microsoft Edge"
+    assert a_stats[0]["active_seconds"] == 90
+
+    app = QApplication.instance() or QApplication([])
+    bar = TopBarWindow()
+    bar.update_course_timer_display("CENG201", 125, is_actively_working=True, courses=courses, course_stats=c_stats, app_stats=a_stats)
+    assert "CENG201" in bar.course_timer_btn.text()
+    assert "00:02:05" in bar.course_timer_btn.text()
+    assert "Boşta" not in bar.course_timer_btn.text()
+
+    bar.update_course_timer_display("CENG201", 125, is_actively_working=False)
+    assert "Boşta" in bar.course_timer_btn.text()
+
+    # Çubuk kapatılıp tekrar açıldığında (ör. acil çıkış sonrası yeni oturum) saat sayacı aktif kalmalı
+    bar.allow_closing(True)
+    bar.close()
+    assert bar._clock_timer.isActive() is False
+
+    bar.allow_closing(False)
+    bar.show()
+    app.processEvents()
+    assert bar._clock_timer.isActive() is True
+
+    # Tek işlemli record_active_tick testi
+    new_sec = db.record_active_tick(
+        logical_date=ldate,
+        course_code="CENG201",
+        is_active=True,
+        app_exe="msedge.exe",
+        app_display="Microsoft Edge",
+    )
+    assert new_sec == 126
+
+    bar.allow_closing(True)
+    bar.close()

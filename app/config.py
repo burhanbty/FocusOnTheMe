@@ -59,6 +59,7 @@ POPOVER_FADE_MS: int = 120                      # En fazla 120 ms solma animasyo
 ENFORCER_INTERVAL_MS: int = 1000        # ~1 sn'lik hafif kontrol döngüsü
 WARNING_COUNTDOWN_SECONDS: int = 5      # 5 sn geri sayımlı uyarı
 FORCE_KILL_GRACE_SECONDS: int = 3       # WM_CLOSE sonrası 3 sn bekleme
+IDLE_THRESHOLD_SECONDS: int = 120       # 2 dakika (120 sn) etkileşim yoksa sayaç "Duraklatıldı (Boşta)" olur
 
 # ---------------------------------------------------------------------------
 # Kayıt Defteri (Registry) ve Zamanlanmış Görev Sabitleri
@@ -186,6 +187,27 @@ DEFAULT_ALLOWED_URLS: list[str] = [
     "*.gstatic.com",
     "*.googleapis.com",
     "scholar.google.com",
+]
+
+# Edge'de yerel PDF ve ders klasörü dosyalarının açılabilmesi için her zaman izin verilen iç şemalar
+EDGE_REQUIRED_LOCAL_SCHEMES: list[str] = [
+    "file://*",
+    "edge://*",
+    "chrome-extension://*",
+]
+
+# Ön tanımlı ders listesi (Ders Kodu, Ders Adı)
+DEFAULT_COURSES: list[tuple[str, str]] = [
+    ("CENG101", "INTRODUCTION TO COMPUTER ENGINEERING"),
+    ("CENG113", "COMPUTER PROGRAMMING I"),
+    ("CENG201", "OBJECT ORIENTED PROGRAMMING"),
+    ("CENG203", "DIGITAL DESIGN"),
+    ("CENG207", "PROBABILITY AND STATISTICS"),
+    ("CENG209", "SYSTEMS PROGRAMMING"),
+    ("ENGR227", "BASIC PHOTOGRAPHY"),
+    ("ENGR265", "PRINCIPLES OF OCCUPATIONAL HEALTH AND SAFETY I"),
+    ("MATH101", "CALCULUS I"),
+    ("MATH201", "DIFFERENTIAL EQUATIONS"),
 ]
 
 

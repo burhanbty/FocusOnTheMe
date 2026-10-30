@@ -1,4 +1,4 @@
-"""Gün Sonu Tebrik, Park Edilen Düşünceler ve Basit İstatistik Ekranı (SummaryScreenWindow)."""
+"""Gün Sonu Tebrik, Ders/Uygulama Süre Dağılımı, Park Edilen Düşünceler ve İstatistik Ekranı."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.core.activity_tracker import format_duration_human
 from app.ui.styles import (
     ACCENT_HEX,
     GLOBAL_STYLESHEET,
@@ -34,8 +35,8 @@ class SummaryScreenWindow(QWidget):
     def __init__(self) -> None:
         super().__init__(None)
         self.setWindowTitle("Ders Kilidi — Gün Tamamlandı")
-        self.resize(720, 520)
-        self.setMinimumSize(640, 460)
+        self.resize(820, 620)
+        self.setMinimumSize(720, 520)
         self.setStyleSheet(GLOBAL_STYLESHEET)
 
         apply_window_liquid_glass_effect(self)
@@ -43,11 +44,11 @@ class SummaryScreenWindow(QWidget):
 
     def _build_ui(self) -> None:
         root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(28, 24, 28, 24)
-        root_layout.setSpacing(16)
+        root_layout.setContentsMargins(28, 22, 28, 22)
+        root_layout.setSpacing(14)
 
         title_lbl = QLabel("Tebrikler! Bugünün Tüm Görevleri Tamamlandı")
-        title_lbl.setStyleSheet("font-size: 22px; font-weight: 700; color: #F8FAFC;")
+        title_lbl.setStyleSheet("font-size: 21px; font-weight: 700; color: #F8FAFC;")
         root_layout.addWidget(title_lbl)
 
         sub_lbl = QLabel("Tüm masaüstü, görev çubuğu ve Microsoft Edge kısıtları kaldırıldı.")
@@ -59,18 +60,41 @@ class SummaryScreenWindow(QWidget):
         cards_row.setSpacing(12)
 
         self.tasks_card_val = self._create_stat_card(cards_row, "Tamamlanan Görev", "0/0")
-        self.duration_card_val = self._create_stat_card(cards_row, "Ders Modu Süresi", "0 dk")
+        self.duration_card_val = self._create_stat_card(cards_row, "Aktif Çalışma Süresi", "0 dk")
         self.blocked_card_val = self._create_stat_card(cards_row, "Kapatılan İzinsiz Uygulama", "0")
         self.streak_card_val = self._create_stat_card(cards_row, "Üst Üste Gün Serisi", "1 gün")
 
         root_layout.addLayout(cards_row)
 
-        # Düşünce Park Alanı Notları
+        # Orta Bölüm: Yan Yana Ders Süreleri ve Uygulama Süreleri
+        breakdown_row = QHBoxLayout()
+        breakdown_row.setSpacing(14)
+
+        course_col = QVBoxLayout()
+        course_hdr = QLabel("Derslere Göre Aktif Çalışma Süresi:")
+        course_hdr.setStyleSheet("font-size: 13px; font-weight: 600; color: #F1F5F9;")
+        course_col.addWidget(course_hdr)
+        self.course_stats_list = QListWidget()
+        course_col.addWidget(self.course_stats_list, 1)
+        breakdown_row.addLayout(course_col, 1)
+
+        app_col = QVBoxLayout()
+        app_hdr = QLabel("Hangi Uygulamada Ne Kadar Süre Geçirildi:")
+        app_hdr.setStyleSheet("font-size: 13px; font-weight: 600; color: #F1F5F9;")
+        app_col.addWidget(app_hdr)
+        self.app_stats_list = QListWidget()
+        app_col.addWidget(self.app_stats_list, 1)
+        breakdown_row.addLayout(app_col, 1)
+
+        root_layout.addLayout(breakdown_row, 2)
+
+        # Alt Bölüm: Düşünce Park Alanı Notları
         thoughts_hdr = QLabel("Ders Sırasında Park Ettiğiniz Düşünceler (Ctrl+Alt+P):")
-        thoughts_hdr.setStyleSheet("font-size: 14px; font-weight: 600; color: #F1F5F9; margin-top: 6px;")
+        thoughts_hdr.setStyleSheet("font-size: 13px; font-weight: 600; color: #F1F5F9;")
         root_layout.addWidget(thoughts_hdr)
 
         self.thoughts_list = QListWidget()
+        self.thoughts_list.setMaximumHeight(130)
         root_layout.addWidget(self.thoughts_list, 1)
 
         # Alt Butonlar
@@ -98,11 +122,11 @@ class SummaryScreenWindow(QWidget):
             "}"
         )
         c_layout = QVBoxLayout(card)
-        c_layout.setContentsMargins(14, 12, 14, 12)
+        c_layout.setContentsMargins(14, 10, 14, 10)
         c_layout.setSpacing(4)
 
         val_lbl = QLabel(initial_val)
-        val_lbl.setStyleSheet(f"font-size: 22px; font-weight: 700; color: {ACCENT_HEX}; border: none; background: transparent;")
+        val_lbl.setStyleSheet(f"font-size: 20px; font-weight: 700; color: {ACCENT_HEX}; border: none; background: transparent;")
         lbl = QLabel(label_text)
         lbl.setStyleSheet(f"font-size: 12px; color: {TEXT_SECONDARY}; border: none; background: transparent;")
         lbl.setWordWrap(True)
@@ -112,21 +136,52 @@ class SummaryScreenWindow(QWidget):
         parent_layout.addWidget(card, 1)
         return val_lbl
 
-    def load_summary(self, stats: dict[str, Any], thoughts: list[dict[str, Any]]) -> None:
+    def load_summary(
+        self,
+        stats: dict[str, Any],
+        thoughts: list[dict[str, Any]],
+        course_stats: list[dict[str, Any]] | None = None,
+        app_stats: list[dict[str, Any]] | None = None,
+    ) -> None:
         comp = stats.get("completed_tasks", 0)
         tot = stats.get("total_tasks", 0)
-        mins = stats.get("focus_minutes", 0.0)
-        secs = stats.get("focus_seconds", 0)
+        secs = int(stats.get("focus_seconds", 0))
         blocked = stats.get("blocked_app_count", 0)
         streak = stats.get("streak_days", 0)
 
         self.tasks_card_val.setText(f"{comp}/{tot}")
-        if mins >= 1.0:
-            self.duration_card_val.setText(f"{mins:.1f} dk")
-        else:
-            self.duration_card_val.setText(f"{secs} sn")
+        self.duration_card_val.setText(format_duration_human(secs))
         self.blocked_card_val.setText(str(blocked))
         self.streak_card_val.setText(f"{streak} gün")
+
+        self.course_stats_list.clear()
+        c_list = course_stats or []
+        if not c_list:
+            empty_c = QListWidgetItem("Bugün için kayıtlı ders çalışma süresi yok.")
+            empty_c.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.course_stats_list.addItem(empty_c)
+        else:
+            for c in c_list:
+                code = str(c.get("course_code") or "")
+                name = str(c.get("course_name") or code)
+                c_sec = int(c.get("active_seconds") or 0)
+                self.course_stats_list.addItem(
+                    f"📚  {code} ({name})   —   {format_duration_human(c_sec)}"
+                )
+
+        self.app_stats_list.clear()
+        a_list = app_stats or []
+        if not a_list:
+            empty_a = QListWidgetItem("Bugün için kayıtlı uygulama kullanım süresi yok.")
+            empty_a.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.app_stats_list.addItem(empty_a)
+        else:
+            for a in a_list:
+                disp = str(a.get("display_name") or a.get("exe_name") or "Uygulama")
+                a_sec = int(a.get("active_seconds") or 0)
+                self.app_stats_list.addItem(
+                    f"🖥️  {disp}   —   {format_duration_human(a_sec)}"
+                )
 
         self.thoughts_list.clear()
         if not thoughts:

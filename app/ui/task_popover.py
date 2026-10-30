@@ -1,9 +1,10 @@
-"""Üst çubuktan açılan Liquid Glass Görev Listesi (TaskPopover) ve Ders Klasörü (StudyFolderPopover) panelleri.
+"""Üst çubuktan açılan Liquid Glass Görev Listesi (TaskPopover), Ders Klasörü Gezgini (StudyFolderPopover)
+ve Aktif Ders / Uygulama Süre Takibi (CourseAndActivityPopover) panelleri.
 
 Özellikler:
 - Dışına tıklanınca otomatik kapanır (Qt.Popup).
 - Açılış ve kapanışta en fazla 120 ms'lik solma (opacity fade) animasyonu kullanır.
-- 14 px köşe yuvarlaklığı, rgba(255,255,255,0.18) kenarlık ve DWM Acrylic/Liquid Glass arka plan.
+- StudyFolderPopover sınırsız derinlikte alt klasör gezintisi (`📁` klasöre gir, `⬅️ ..` üst klasöre dön) sunar.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from PySide6.QtCore import (
     Qt,
     Signal,
 )
-from PySide6.QtGui import QColor, QPainter, QPaintEvent
+from PySide6.QtGui import QPainter, QPaintEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QFrame,
@@ -34,6 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.config import POPOVER_FADE_MS, TOP_BAR_RADIUS
+from app.core.activity_tracker import format_duration_human
 from app.ui.styles import (
     ACCENT_HEX,
     GLOBAL_STYLESHEET,
@@ -214,13 +216,14 @@ class TaskPopover(BaseGlassPopover):
 
 
 class StudyFolderPopover(BaseGlassPopover):
-    """'Ders Klasörü' butonuna tıklanınca seçili klasörün dosyalarını listeleyen cam panel."""
+    """'Ders Klasörü' butonuna tıklanınca alt klasörler ve dosyalar arasında gezinmeyi sağlayan cam panel."""
 
     file_clicked = Signal(str)  # tam dosya yolu
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent=parent, width=380, max_height=420)
-        self._folder_path: str = ""
+        super().__init__(parent=parent, width=410, max_height=450)
+        self._root_folder: Path | None = None
+        self._current_folder: Path | None = None
 
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(16, 14, 16, 14)
@@ -231,7 +234,7 @@ class StudyFolderPopover(BaseGlassPopover):
         root_layout.addWidget(self.header_lbl)
 
         self.path_lbl = QLabel("")
-        self.path_lbl.setStyleSheet(f"font-size: 11px; color: {TEXT_SECONDARY};")
+        self.path_lbl.setStyleSheet(f"font-size: 11px; color: {ACCENT_HEX}; font-weight: 500;")
         self.path_lbl.setWordWrap(True)
         root_layout.addWidget(self.path_lbl)
 
@@ -239,15 +242,18 @@ class StudyFolderPopover(BaseGlassPopover):
         self.file_list.itemClicked.connect(self._on_item_clicked)
         root_layout.addWidget(self.file_list, 1)
 
-        hint_lbl = QLabel("Dosyaya tıkladığınızda varsayılan uygulamayla açılır.")
+        hint_lbl = QLabel("Klasörlere tıklayarak içine girebilir, dosyalara tıklayarak açabilirsiniz.")
         hint_lbl.setStyleSheet(f"font-size: 11px; color: {TEXT_SECONDARY};")
+        hint_lbl.setWordWrap(True)
         root_layout.addWidget(hint_lbl)
 
     def load_folder(self, folder_path: str) -> None:
-        self._folder_path = (folder_path or "").strip()
-        self.file_list.clear()
-
-        if not self._folder_path or not os.path.isdir(self._folder_path):
+        """Ana Ders Klasörünü yükler; daha önce bir alt klasörde kalındıysa aynı kök altındaysa korur."""
+        cleaned = (folder_path or "").strip()
+        if not cleaned or not os.path.isdir(cleaned):
+            self._root_folder = None
+            self._current_folder = None
+            self.file_list.clear()
             self.path_lbl.setText("Sabah ayarlarından bir Ders Klasörü seçilmemiş.")
             empty_item = QListWidgetItem("Klasör tanımlanmamış veya bulunamadı.")
             empty_item.setFlags(Qt.ItemFlag.NoItemFlags)
@@ -255,45 +261,181 @@ class StudyFolderPopover(BaseGlassPopover):
             self.setFixedHeight(200)
             return
 
-        folder = Path(self._folder_path)
-        self.path_lbl.setText(str(folder))
+        new_root = Path(cleaned).resolve()
+        if self._root_folder != new_root or self._current_folder is None:
+            self._root_folder = new_root
+            self._current_folder = new_root
+        elif not self._is_within_root(self._current_folder):
+            self._current_folder = new_root
 
-        entries: list[Path] = []
+        self._render_current_directory()
+
+    def navigate_to_subfolder(self, target_dir: str | Path) -> None:
+        """Alt klasöre (veya üst klasöre) geçiş yapar."""
+        target = Path(target_dir).resolve()
+        if self._is_within_root(target) and target.is_dir():
+            self._current_folder = target
+            self._render_current_directory()
+
+    def _is_within_root(self, candidate: Path) -> bool:
+        if self._root_folder is None:
+            return False
         try:
-            for entry in sorted(folder.iterdir(), key=lambda p: p.name.lower()):
+            candidate.resolve().relative_to(self._root_folder.resolve())
+            return True
+        except ValueError:
+            return False
+
+    def _render_current_directory(self) -> None:
+        self.file_list.clear()
+        if self._root_folder is None or self._current_folder is None:
+            return
+
+        try:
+            rel = self._current_folder.relative_to(self._root_folder)
+            rel_str = "" if str(rel) == "." else f" / {str(rel).replace(os.sep, ' / ')}"
+        except ValueError:
+            rel_str = ""
+
+        self.path_lbl.setText(f"📂 {self._root_folder.name}{rel_str}")
+
+        row_count = 0
+        # Eğer alt klasördeysek en üste "Üst Klasöre Dön (..)" öğesi ekle
+        if self._current_folder != self._root_folder:
+            parent_dir = self._current_folder.parent
+            if self._is_within_root(parent_dir):
+                up_item = QListWidgetItem("⬅️  .. (Üst Klasöre Dön)")
+                up_item.setData(Qt.ItemDataRole.UserRole, ("dir", str(parent_dir)))
+                up_item.setToolTip(str(parent_dir))
+                self.file_list.addItem(up_item)
+                row_count += 1
+
+        dirs: list[Path] = []
+        files: list[Path] = []
+        try:
+            for entry in sorted(self._current_folder.iterdir(), key=lambda p: p.name.lower()):
                 if entry.name.startswith("."):
                     continue
-                if entry.is_file():
-                    entries.append(entry)
-                elif entry.is_dir():
-                    # Bir alt seviyedeki dosyaları da "AltKlasör / dosya" olarak listele
-                    try:
-                        for sub in sorted(entry.iterdir(), key=lambda sp: sp.name.lower()):
-                            if sub.is_file() and not sub.name.startswith("."):
-                                entries.append(sub)
-                    except OSError:
-                        pass
+                if entry.is_dir():
+                    dirs.append(entry)
+                elif entry.is_file():
+                    files.append(entry)
         except OSError:
             pass
 
-        if not entries:
-            empty_item = QListWidgetItem("Bu klasörde gösterilecek dosya yok.")
-            empty_item.setFlags(Qt.ItemFlag.NoItemFlags)
-            self.file_list.addItem(empty_item)
-            self.setFixedHeight(210)
-            return
+        for dpath in dirs:
+            item = QListWidgetItem(f"📁  {dpath.name}")
+            item.setData(Qt.ItemDataRole.UserRole, ("dir", str(dpath)))
+            item.setToolTip(f"Klasör: {dpath}")
+            self.file_list.addItem(item)
+            row_count += 1
 
-        for fpath in entries[:200]:
-            rel_name = str(fpath.relative_to(folder))
-            item = QListWidgetItem(f"📄  {rel_name}")
-            item.setData(Qt.ItemDataRole.UserRole, str(fpath))
+        for fpath in files:
+            item = QListWidgetItem(f"📄  {fpath.name}")
+            item.setData(Qt.ItemDataRole.UserRole, ("file", str(fpath)))
             item.setToolTip(str(fpath))
             self.file_list.addItem(item)
+            row_count += 1
 
-        self.setFixedHeight(min(400, max(230, 130 + len(entries) * 32)))
+        if row_count == 0 or (len(dirs) == 0 and len(files) == 0):
+            empty_item = QListWidgetItem("Bu klasörde alt klasör veya dosya yok.")
+            empty_item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.file_list.addItem(empty_item)
+            row_count += 1
+
+        self.setFixedHeight(min(440, max(230, 130 + row_count * 32)))
 
     def _on_item_clicked(self, item: QListWidgetItem) -> None:
-        full_path = item.data(Qt.ItemDataRole.UserRole)
-        if full_path and os.path.isfile(str(full_path)):
+        payload = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(payload, tuple) or len(payload) != 2:
+            return
+        kind, target_path = payload
+        if kind == "dir":
+            self.navigate_to_subfolder(target_path)
+        elif kind == "file" and os.path.isfile(str(target_path)):
             self.close_with_fade()
-            self.file_clicked.emit(str(full_path))
+            self.file_clicked.emit(str(target_path))
+
+
+class CourseAndActivityPopover(BaseGlassPopover):
+    """Üst çubuktaki Ders / Aktif Sayaç butonuna tıklanınca açılan ders seçimi ve uygulama süreleri paneli."""
+
+    course_selected = Signal(str)  # course_code
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent=parent, width=450, max_height=480)
+
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(16, 14, 16, 14)
+        root_layout.setSpacing(8)
+
+        course_hdr = QLabel("Şu An Çalıştığınız Dersi Seçin")
+        course_hdr.setStyleSheet("font-size: 14px; font-weight: 600; color: #F8FAFC;")
+        root_layout.addWidget(course_hdr)
+
+        course_sub = QLabel(
+            "Sayaç yalnızca aktif etkileşim (fare, kaydırma, dokunma, klavye) varken ilerler; "
+            "2 dakika hareketsizlikte otomatik duraklatılır."
+        )
+        course_sub.setStyleSheet(f"font-size: 11px; color: {TEXT_SECONDARY};")
+        course_sub.setWordWrap(True)
+        root_layout.addWidget(course_sub)
+
+        self.course_list = QListWidget()
+        self.course_list.setMinimumHeight(180)
+        self.course_list.itemClicked.connect(self._on_course_item_clicked)
+        root_layout.addWidget(self.course_list, 3)
+
+        app_hdr = QLabel("Bugün Uygulamalarda Geçirilen Aktif Süre")
+        app_hdr.setStyleSheet("font-size: 13px; font-weight: 600; color: #F8FAFC; margin-top: 4px;")
+        root_layout.addWidget(app_hdr)
+
+        self.app_usage_list = QListWidget()
+        self.app_usage_list.setMinimumHeight(105)
+        root_layout.addWidget(self.app_usage_list, 2)
+
+        self.setFixedHeight(450)
+
+    def refresh_data(
+        self,
+        courses: list[dict[str, Any]],
+        active_course_code: str,
+        course_stats: list[dict[str, Any]],
+        app_stats: list[dict[str, Any]],
+    ) -> None:
+        seconds_by_course = {
+            str(r["course_code"]): int(r.get("active_seconds") or 0) for r in course_stats
+        }
+
+        self.course_list.clear()
+        for c in courses:
+            code = str(c["code"])
+            name = str(c["name"])
+            sec = seconds_by_course.get(code, 0)
+            dur_str = format_duration_human(sec) if sec > 0 else "0 sn"
+            prefix = "● " if code == active_course_code else "○ "
+            item_text = f"{prefix}{code} — {name}   ({dur_str})"
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.ItemDataRole.UserRole, code)
+            if code == active_course_code:
+                item.setSelected(True)
+            self.course_list.addItem(item)
+
+        self.app_usage_list.clear()
+        if not app_stats:
+            empty_item = QListWidgetItem("Henüz uygulama kullanım süresi kaydedilmedi.")
+            empty_item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.app_usage_list.addItem(empty_item)
+        else:
+            for a in app_stats:
+                disp = str(a.get("display_name") or a.get("exe_name") or "Uygulama")
+                sec = int(a.get("active_seconds") or 0)
+                item = QListWidgetItem(f"🖥️  {disp}   •   {format_duration_human(sec)}")
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                self.app_usage_list.addItem(item)
+
+    def _on_course_item_clicked(self, item: QListWidgetItem) -> None:
+        code = item.data(Qt.ItemDataRole.UserRole)
+        if code:
+            self.close_with_fade()
+            self.course_selected.emit(str(code))

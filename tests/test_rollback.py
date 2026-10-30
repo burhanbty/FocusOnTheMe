@@ -119,6 +119,9 @@ def test_edge_policy_apply_and_clear_hkcu() -> None:
         assert state["hkcu"]["guest_disabled"] is True
         assert state["hkcu"]["blocklist"] == ["*"]
         assert "gemini.google.com" in state["hkcu"]["allowlist"]
+        # PDF ve yerel dosyaların Edge'de açılabilmesi için file://* otomatik eklenmeli
+        assert "file://*" in state["hkcu"]["allowlist"]
+        assert "edge://*" in state["hkcu"]["allowlist"]
     finally:
         clear_res = clear_edge_policies()
         assert clear_res["hkcu"] is True

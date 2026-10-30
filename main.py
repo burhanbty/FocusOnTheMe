@@ -7,15 +7,14 @@ import os
 import signal
 import subprocess
 import sys
-import traceback
 from typing import Any
 
 import psutil
 from PySide6.QtCore import QObject, QTimer, Signal
-from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication
 
 from app import config
+from app.core.activity_tracker import get_foreground_app_info, is_user_actively_working
 from app.core.auth import EmergencyAuthManager
 from app.core.database import Database
 from app.core.input_blocker import InputBlocker
@@ -28,6 +27,7 @@ from app.core.taskbar_lock import ensure_taskbar_hidden
 from app.ui.backdrop_window import DesktopBackdropWindow
 from app.ui.emergency_dialog import EmergencyExitDialog
 from app.ui.morning_setup import MorningSetupWindow
+from app.ui.proof_dialog import ScreenshotProofDialog
 from app.ui.summary_screen import SummaryScreenWindow
 from app.ui.thought_modal import ThoughtModal
 from app.ui.top_bar import TopBarWindow
@@ -74,6 +74,7 @@ class StudyLockController(QObject):
         self.warning_toast: WarningToast | None = None
         self.thought_modal: ThoughtModal | None = None
         self.emergency_dialog: EmergencyExitDialog | None = None
+        self.proof_dialog: ScreenshotProofDialog | None = None
         self.summary_win: SummaryScreenWindow | None = None
 
         self._lock_active: bool = False
@@ -94,7 +95,10 @@ class StudyLockController(QObject):
             if self.resume_mode:
                 self.enter_study_lock_mode(resumed=True)
                 return
-            # Önceki oturumdan yarım kalan kilit varsa temizle ve sabah ekranını aç
+            # Eğer başka bir ana süreç şu an canlı olarak çalışıyorsa onun durumunu bozma, çık
+            existing_main_pid = int(state.get("main_pid") or 0)
+            if existing_main_pid > 0 and existing_main_pid != os.getpid() and psutil.pid_exists(existing_main_pid):
+                sys.exit(0)
             rollback_all_system_locks(reason="stale_session_cleanup")
 
         self.show_morning_setup()
@@ -122,6 +126,13 @@ class StudyLockController(QObject):
 
         self._lock_active = True
         self.db.start_or_resume_session(logical_date)
+
+        # İlk tamamlanmamış görevin dersini varsayılan aktif ders olarak senkronize et
+        first_pending = next((t for t in tasks if not t.get("completed")), None)
+        if first_pending and first_pending.get("subject"):
+            subj = str(first_pending["subject"]).strip()
+            if subj:
+                self.db.set_active_course(subj)
 
         # 1. Sistem kısıtlarını ve durum yedeğini etkinleştir
         allowed_urls = self.db.get_allowed_urls(only_enabled=True)
@@ -154,6 +165,13 @@ class StudyLockController(QObject):
             self.top_bar_win = TopBarWindow()
             self.top_bar_win.app_launch_requested.connect(self._on_launch_app)
             self.top_bar_win.task_toggled.connect(self._on_task_toggled)
+            self.top_bar_win.course_changed.connect(self._on_course_changed)
+            self.top_bar_win.course_popover_opening.connect(
+                lambda: self._refresh_top_bar_course_and_activity(
+                    is_actively_working=is_user_actively_working(config.IDLE_THRESHOLD_SECONDS),
+                    full_lists=True,
+                )
+            )
             self.top_bar_win.thought_parking_requested.connect(self.open_thought_modal)
             self.top_bar_win.study_file_open_requested.connect(self._on_open_study_file)
             self.top_bar_win.emergency_exit_requested.connect(self.open_emergency_dialog)
@@ -163,6 +181,7 @@ class StudyLockController(QObject):
         self.top_bar_win.set_allowed_apps(allowed_apps)
         self.top_bar_win.set_tasks(tasks)
         self.top_bar_win.set_study_folder(self.db.get_study_folder())
+        self._refresh_top_bar_course_and_activity(is_actively_working=True, full_lists=True)
         self.top_bar_win.show()
         self.top_bar_win.raise_()
 
@@ -179,12 +198,21 @@ class StudyLockController(QObject):
                 lambda: self.exit_study_lock_mode(reason="emergency_exit", show_summary=False)
             )
 
+        if self.proof_dialog is None:
+            self.proof_dialog = ScreenshotProofDialog()
+            self.proof_dialog.proof_confirmed.connect(self._on_proof_confirmed)
+            self.proof_dialog.proof_cancelled.connect(self._on_proof_cancelled)
+
         # 5. Klavye kancasını ve 1 sn'lik denetim döngüsünü başlat
         self.input_blocker.start()
         self._tick_timer.start()
 
     def _ensure_watchdog_running(self) -> None:
+        if not self._lock_active:
+            return
         state = self.snapshot_mgr.read_state()
+        if not state.get("lock_active", False):
+            return
         existing_wd_pid = int(state.get("watchdog_pid") or 0)
         if existing_wd_pid > 0 and psutil.pid_exists(existing_wd_pid):
             self._watchdog_pid = existing_wd_pid
@@ -213,6 +241,42 @@ class StudyLockController(QObject):
         except Exception:
             pass
 
+    def _on_course_changed(self, course_code: str) -> None:
+        self.db.set_active_course(course_code)
+        actively_working = is_user_actively_working(config.IDLE_THRESHOLD_SECONDS)
+        self._refresh_top_bar_course_and_activity(is_actively_working=actively_working, full_lists=True)
+
+    def _refresh_top_bar_course_and_activity(
+        self,
+        is_actively_working: bool,
+        full_lists: bool = False,
+        known_course_sec: int | None = None,
+    ) -> None:
+        if self.top_bar_win is None:
+            return
+        logical_date = get_logical_date()
+        active_course = self.db.get_active_course()
+        course_sec = (
+            known_course_sec
+            if known_course_sec is not None
+            else self.db.get_course_study_seconds(active_course, logical_date)
+        )
+
+        # Tam listeleri yalnızca başlangıçta, ders değiştiğinde veya popover açıkken sorgula
+        need_lists = full_lists or self.top_bar_win.course_popover.isVisible()
+        courses = self.db.get_courses() if need_lists else None
+        course_stats = self.db.get_course_study_stats(logical_date) if need_lists else None
+        app_stats = self.db.get_app_usage_stats(logical_date) if need_lists else None
+
+        self.top_bar_win.update_course_timer_display(
+            course_code=active_course,
+            active_seconds=course_sec,
+            is_actively_working=is_actively_working,
+            courses=courses,
+            course_stats=course_stats,
+            app_stats=app_stats,
+        )
+
     def _on_second_tick(self) -> None:
         if not self._lock_active:
             return
@@ -226,8 +290,32 @@ class StudyLockController(QObject):
         # 2. Görev çubuğunun gizli kaldığından emin ol
         ensure_taskbar_hidden()
 
-        # 3. Odak süresini +1 sn artır
-        self.db.increment_focus_seconds(1)
+        # 3. Kullanıcı aktif olarak çalışıyor mu? (Son 2 dk = 120 sn içinde fare/scroll/dokunma/klavye var mı?)
+        logical_date = get_logical_date()
+        actively_working = is_user_actively_working(config.IDLE_THRESHOLD_SECONDS)
+        active_course = self.db.get_active_course()
+
+        app_exe: str | None = None
+        app_disp: str | None = None
+        if actively_working:
+            fg_app = get_foreground_app_info(own_pids=self.enforcer.own_pids)
+            if fg_app is not None:
+                app_exe = fg_app["exe_name"]
+                app_disp = fg_app["display_name"]
+
+        course_sec = self.db.record_active_tick(
+            logical_date=logical_date,
+            course_code=active_course,
+            is_active=actively_working,
+            app_exe=app_exe,
+            app_display=app_disp,
+        )
+
+        self._refresh_top_bar_course_and_activity(
+            is_actively_working=actively_working,
+            full_lists=False,
+            known_course_sec=course_sec,
+        )
 
         # 4. Watchdog hala hayatta mı kontrol et
         self._ensure_watchdog_running()
@@ -254,25 +342,60 @@ class StudyLockController(QObject):
 
     def _on_task_toggled(self, task_id: int, completed: bool) -> None:
         logical_date = get_logical_date()
-        proof_path: str | None = None
 
+        # Eğer görev tamamlanıyorsa ve ekran görüntüsü kanıtı zorunluysa:
+        # Görev panelini gizle ve 250 ms sonra Ekran Görüntüsü Kanıtı onay diyaloğunu aç
         if completed and self.db.is_screenshot_proof_required():
-            try:
-                day_dir = config.PROOFS_DIR / logical_date
-                day_dir.mkdir(parents=True, exist_ok=True)
-                out_file = day_dir / f"task_{task_id}.png"
-                screen = QGuiApplication.primaryScreen()
-                if screen is not None:
-                    pixmap = screen.grabWindow(0)
-                    pixmap.save(str(out_file), "PNG")
-                    proof_path = str(out_file)
-            except Exception:
-                proof_path = None
+            tasks = self.db.get_tasks_for_date(logical_date)
+            target_task = next((t for t in tasks if int(t["id"]) == int(task_id)), None)
+            if target_task is not None and self.proof_dialog is not None:
+                if self.top_bar_win is not None:
+                    self.top_bar_win.task_popover.hide()
+                QTimer.singleShot(
+                    250,
+                    lambda t=target_task, d=logical_date: self.proof_dialog.start_capture_for_task(t, d)
+                    if self.proof_dialog is not None
+                    else None,
+                )
+                return
 
-        self.db.set_task_completed(task_id=task_id, completed=completed, proof_path=proof_path)
+        self._finalize_task_completion(task_id=task_id, completed=completed, proof_path=None)
+
+    def _on_proof_confirmed(self, task_id: int, saved_path: str) -> None:
+        self._finalize_task_completion(
+            task_id=task_id,
+            completed=True,
+            proof_path=saved_path or None,
+        )
+
+    def _on_proof_cancelled(self, task_id: int) -> None:
+        # Kullanıcı kanıt ekranında Vazgeç'e bastı -> görevi tamamlanmamış olarak koru
+        logical_date = get_logical_date()
+        self.db.set_task_completed(task_id=task_id, completed=False)
         tasks = self.db.get_tasks_for_date(logical_date)
         if self.top_bar_win is not None:
             self.top_bar_win.set_tasks(tasks)
+
+    def _finalize_task_completion(
+        self,
+        task_id: int,
+        completed: bool,
+        proof_path: str | None = None,
+    ) -> None:
+        logical_date = get_logical_date()
+        self.db.set_task_completed(task_id=task_id, completed=completed, proof_path=proof_path)
+        tasks = self.db.get_tasks_for_date(logical_date)
+
+        # Sıradaki tamamlanmamış görevin dersine otomatik geçiş yap
+        next_pending = next((t for t in tasks if not t.get("completed")), None)
+        if next_pending and next_pending.get("subject"):
+            self.db.set_active_course(str(next_pending["subject"]).strip())
+
+        if self.top_bar_win is not None:
+            self.top_bar_win.set_tasks(tasks)
+            self._refresh_top_bar_course_and_activity(
+                is_actively_working=is_user_actively_working(config.IDLE_THRESHOLD_SECONDS)
+            )
 
         # Tüm görevler tamamlandıysa oturumu bitir ve tebrik ekranını aç
         if tasks and all(bool(t.get("completed")) for t in tasks):
@@ -297,20 +420,19 @@ class StudyLockController(QObject):
         self._tick_timer.stop()
         self.input_blocker.stop()
 
-        # Önce sistem kısıtlarını kaldır ve state_snapshot.json içinde lock_active=False yap
         rollback_all_system_locks(reason=reason, delete_scheduled_task=True)
 
         if reason == "emergency_exit":
             self.db.mark_session_status("emergency_exit")
 
-        # Kabuk pencerelerini kapat
-        for win in (self.warning_toast, self.thought_modal, self.emergency_dialog):
+        for win in (self.warning_toast, self.thought_modal, self.emergency_dialog, self.proof_dialog):
             if win is not None:
                 win.hide()
 
         if self.top_bar_win is not None:
             self.top_bar_win.task_popover.hide()
             self.top_bar_win.folder_popover.hide()
+            self.top_bar_win.course_popover.hide()
             self.top_bar_win.allow_closing(True)
             self.top_bar_win.close()
 
@@ -327,12 +449,19 @@ class StudyLockController(QObject):
         logical_date = get_logical_date()
         stats = self.db.get_session_stats(logical_date)
         thoughts = self.db.get_thoughts_for_date(logical_date)
+        course_stats = self.db.get_course_study_stats(logical_date)
+        app_stats = self.db.get_app_usage_stats(logical_date)
 
         if self.summary_win is None:
             self.summary_win = SummaryScreenWindow()
             self.summary_win.new_session_requested.connect(self.show_morning_setup)
 
-        self.summary_win.load_summary(stats=stats, thoughts=thoughts)
+        self.summary_win.load_summary(
+            stats=stats,
+            thoughts=thoughts,
+            course_stats=course_stats,
+            app_stats=app_stats,
+        )
         self.summary_win.show()
         self.summary_win.raise_()
         self.summary_win.activateWindow()

@@ -4,7 +4,8 @@ Düzen ve Özellikler:
 - Konum ve Boyut: x=8, y=8, genişlik=ekran_genişliği-16, yükseklik=44 px.
 - Köşe yuvarlaklığı: 14 px, ince açık kenarlık (rgba 255,255,255,0.18), her zaman üstte.
 - Sol: İzinli uygulama ikonları (tıklanınca açılır) + TEST_MODE=True ise "TEST MODU" rozeti.
-- Orta: Aktif görev (örn. "Matematik: 20 soru çöz") ve ilerleme ("2/5"). Tıklanınca TaskPopover açılır.
+- Orta: Aktif görev ("CENG201: 20 soru çöz • 1/3", tıklanınca TaskPopover açılır) +
+        Aktif Ders Seçici ve Çalışma Sayacı ("📚 CENG201 • ⏱ 00:14:25", tıklanınca CourseAndActivityPopover açılır).
 - Sağ: Saat, "Düşünce Park Et" butonu, "Ders Klasörü" butonu, "Acil Çıkış" butonu.
 """
 
@@ -22,6 +23,7 @@ from PySide6.QtGui import (
     QKeyEvent,
     QPainter,
     QPaintEvent,
+    QShowEvent,
 )
 from PySide6.QtWidgets import (
     QFileIconProvider,
@@ -33,13 +35,14 @@ from PySide6.QtWidgets import (
 )
 
 from app import config
+from app.core.activity_tracker import format_duration_hms
 from app.ui.styles import (
     ACCENT_HEX,
     GLOBAL_STYLESHEET,
     apply_window_liquid_glass_effect,
     paint_liquid_glass_surface,
 )
-from app.ui.task_popover import StudyFolderPopover, TaskPopover
+from app.ui.task_popover import CourseAndActivityPopover, StudyFolderPopover, TaskPopover
 
 
 class TopBarWindow(QWidget):
@@ -47,6 +50,8 @@ class TopBarWindow(QWidget):
 
     app_launch_requested = Signal(str)          # exe_path
     task_toggled = Signal(int, bool)            # (task_id, completed)
+    course_changed = Signal(str)                # course_code
+    course_popover_opening = Signal()
     thought_parking_requested = Signal()
     study_file_open_requested = Signal(str)     # file_path
     emergency_exit_requested = Signal()
@@ -65,6 +70,10 @@ class TopBarWindow(QWidget):
         self._allow_close = False
         self._tasks: list[dict[str, Any]] = []
         self._study_folder: str = ""
+        self._active_course_code: str = "CENG101"
+        self._courses: list[dict[str, Any]] = []
+        self._course_stats: list[dict[str, Any]] = []
+        self._app_stats: list[dict[str, Any]] = []
         self._icon_provider = QFileIconProvider()
 
         self._position_bar()
@@ -76,6 +85,9 @@ class TopBarWindow(QWidget):
 
         self.folder_popover = StudyFolderPopover(self)
         self.folder_popover.file_clicked.connect(self.study_file_open_requested.emit)
+
+        self.course_popover = CourseAndActivityPopover(self)
+        self.course_popover.course_selected.connect(self.course_changed.emit)
 
         self._build_ui()
 
@@ -107,7 +119,7 @@ class TopBarWindow(QWidget):
     def _build_ui(self) -> None:
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(12, 4, 12, 4)
-        main_layout.setSpacing(10)
+        main_layout.setSpacing(8)
 
         # ------------------------------------------------------------------
         # SOL BÖLÜM: TEST MODU etiketi (TEST_MODE=True ise) + İzinli Uygulama İkonları
@@ -145,18 +157,24 @@ class TopBarWindow(QWidget):
         main_layout.addStretch(1)
 
         # ------------------------------------------------------------------
-        # ORTA BÖLÜM: Şu Anki Görev ve İlerleme ("2/5") — Tıklanınca TaskPopover açılır
+        # ORTA BÖLÜM: Şu Anki Görev ("2/5") + Aktif Ders Seçici & Canlı Çalışma Sayacı
         # ------------------------------------------------------------------
+        center_container = QWidget()
+        center_container.setStyleSheet("background: transparent;")
+        center_layout = QHBoxLayout(center_container)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(8)
+
         self.center_task_btn = QPushButton("Görev yükleniyor...  0/0")
         self.center_task_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.center_task_btn.setFixedHeight(32)
-        self.center_task_btn.setMinimumWidth(280)
+        self.center_task_btn.setMinimumWidth(240)
         self.center_task_btn.setStyleSheet(
             f"QPushButton {{"
             f"  background-color: rgba(255, 255, 255, 14);"
             f"  border: 1px solid rgba(255, 255, 255, 38);"
             f"  border-radius: 10px;"
-            f"  padding: 4px 16px;"
+            f"  padding: 4px 14px;"
             f"  color: #F8FAFC;"
             f"  font-size: 13px;"
             f"  font-weight: 600;"
@@ -167,7 +185,20 @@ class TopBarWindow(QWidget):
             f"}}"
         )
         self.center_task_btn.clicked.connect(self.toggle_task_popover)
-        main_layout.addWidget(self.center_task_btn, 0, Qt.AlignmentFlag.AlignCenter)
+        center_layout.addWidget(self.center_task_btn)
+
+        self.course_timer_btn = QPushButton("📚 CENG101  •  ⏱ 00:00:00")
+        self.course_timer_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.course_timer_btn.setFixedHeight(32)
+        self.course_timer_btn.setToolTip(
+            "Şu an çalıştığınız dersi seçmek ve uygulama sürelerini görmek için tıklayın.\n"
+            "2 dakika hareketsizlikte sayaç otomatik duraklatılır."
+        )
+        self._apply_course_timer_style(is_active=True)
+        self.course_timer_btn.clicked.connect(self.toggle_course_popover)
+        center_layout.addWidget(self.course_timer_btn)
+
+        main_layout.addWidget(center_container, 0, Qt.AlignmentFlag.AlignCenter)
         main_layout.addStretch(1)
 
         # ------------------------------------------------------------------
@@ -205,7 +236,7 @@ class TopBarWindow(QWidget):
         right_layout.addWidget(self.thought_btn)
 
         self.study_folder_btn = QPushButton("Ders Klasörü")
-        self.study_folder_btn.setToolTip("Seçili ders klasöründeki dosyaları listele ve aç")
+        self.study_folder_btn.setToolTip("Seçili ders klasöründeki alt klasörleri ve dosyaları listele")
         self.study_folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.study_folder_btn.setFixedHeight(30)
         self.study_folder_btn.setStyleSheet(
@@ -245,6 +276,75 @@ class TopBarWindow(QWidget):
         right_layout.addWidget(self.emergency_btn)
 
         main_layout.addWidget(self.right_container, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+    def _apply_course_timer_style(self, is_active: bool) -> None:
+        if is_active:
+            self.course_timer_btn.setStyleSheet(
+                f"QPushButton {{"
+                f"  background-color: rgba(56, 189, 248, 22);"
+                f"  border: 1px solid rgba(56, 189, 248, 115);"
+                f"  border-radius: 10px;"
+                f"  padding: 4px 12px;"
+                f"  color: #E0F2FE;"
+                f"  font-size: 12px;"
+                f"  font-weight: 600;"
+                f"}}"
+                f"QPushButton:hover {{"
+                f"  background-color: rgba(56, 189, 248, 38);"
+                f"  border: 1px solid {ACCENT_HEX};"
+                f"}}"
+            )
+        else:
+            self.course_timer_btn.setStyleSheet(
+                "QPushButton {"
+                "  background-color: rgba(245, 158, 11, 20);"
+                "  border: 1px solid rgba(245, 158, 11, 95);"
+                "  border-radius: 10px;"
+                "  padding: 4px 12px;"
+                "  color: #FDE68A;"
+                "  font-size: 12px;"
+                "  font-weight: 600;"
+                "}"
+                "QPushButton:hover {"
+                "  background-color: rgba(245, 158, 11, 35);"
+                "}"
+            )
+
+    def update_course_timer_display(
+        self,
+        course_code: str,
+        active_seconds: int,
+        is_actively_working: bool,
+        courses: list[dict[str, Any]] | None = None,
+        course_stats: list[dict[str, Any]] | None = None,
+        app_stats: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Üst çubuktaki aktif ders ve çalışma sayacını günceller."""
+        self._active_course_code = (course_code or "CENG101").strip()
+        if courses is not None:
+            self._courses = courses
+        if course_stats is not None:
+            self._course_stats = course_stats
+        if app_stats is not None:
+            self._app_stats = app_stats
+
+        hms = format_duration_hms(active_seconds)
+        if is_actively_working:
+            self.course_timer_btn.setText(f"📚 {self._active_course_code} ▾  •  ⏱ {hms}")
+        else:
+            self.course_timer_btn.setText(f"📚 {self._active_course_code} ▾  •  ⏸ {hms} (Boşta)")
+
+        self._apply_course_timer_style(is_active=is_actively_working)
+        self._update_clock()
+
+        if self.course_popover.isVisible():
+            self.course_popover.refresh_data(
+                courses=self._courses,
+                active_course_code=self._active_course_code,
+                course_stats=self._course_stats,
+                app_stats=self._app_stats,
+            )
+        self.update()
 
     def refresh_test_mode_badge(self) -> None:
         self.test_mode_badge.setVisible(bool(config.TEST_MODE))
@@ -314,8 +414,8 @@ class TopBarWindow(QWidget):
             subj = str(active_task.get("subject") or "").strip()
             title = str(active_task.get("title") or "").strip()
             full_text = f"{subj}: {title}" if subj else title
-            if len(full_text) > 42:
-                full_text = full_text[:39] + "..."
+            if len(full_text) > 36:
+                full_text = full_text[:33] + "..."
             self.center_task_btn.setText(f"{full_text}   •   {completed}/{total}")
         else:
             self.center_task_btn.setText(f"Tüm görevler tamamlandı   •   {completed}/{total}")
@@ -333,6 +433,22 @@ class TopBarWindow(QWidget):
         pop_y = self.y() + self.height() + 6
         self.task_popover.show_at(QPoint(max(8, pop_x), pop_y))
 
+    def toggle_course_popover(self) -> None:
+        if self.course_popover.isVisible():
+            self.course_popover.close_with_fade()
+            return
+        self.course_popover_opening.emit()
+        self.course_popover.refresh_data(
+            courses=self._courses,
+            active_course_code=self._active_course_code,
+            course_stats=self._course_stats,
+            app_stats=self._app_stats,
+        )
+        btn_global = self.course_timer_btn.mapToGlobal(QPoint(0, self.course_timer_btn.height() + 8))
+        pop_x = btn_global.x() + (self.course_timer_btn.width() - self.course_popover.width()) // 2
+        pop_y = self.y() + self.height() + 6
+        self.course_popover.show_at(QPoint(max(8, pop_x), pop_y))
+
     def toggle_study_folder_popover(self) -> None:
         if self.folder_popover.isVisible():
             self.folder_popover.close_with_fade()
@@ -346,7 +462,17 @@ class TopBarWindow(QWidget):
         self.folder_popover.show_at(QPoint(pop_x, pop_y))
 
     def _update_clock(self) -> None:
-        self.clock_lbl.setText(datetime.now().strftime("%H:%M"))
+        new_time = datetime.now().strftime("%H:%M")
+        if self.clock_lbl.text() != new_time:
+            self.clock_lbl.setText(new_time)
+            self.clock_lbl.update()
+            self.update()
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        self._update_clock()
+        if not self._clock_timer.isActive():
+            self._clock_timer.start(1000)
 
     def allow_closing(self, allow: bool = True) -> None:
         self._allow_close = allow

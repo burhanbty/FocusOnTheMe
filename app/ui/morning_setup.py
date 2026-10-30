@@ -16,6 +16,7 @@ from PySide6.QtCore import QRectF, Qt, Signal
 from PySide6.QtGui import QPainter, QPaintEvent
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -149,13 +150,30 @@ class MorningSetupWindow(QWidget):
         form_row = QHBoxLayout()
         form_row.setSpacing(8)
 
-        self.subject_edit = QLineEdit()
-        self.subject_edit.setPlaceholderText("Ders adı (örn. Matematik, Fizik)")
-        self.subject_edit.setFixedWidth(180)
-        form_row.addWidget(self.subject_edit)
+        self.subject_combo = QComboBox()
+        self.subject_combo.setEditable(True)
+        self.subject_combo.setFixedWidth(260)
+        self.subject_combo.setStyleSheet(
+            "QComboBox {"
+            "  background-color: rgba(15, 23, 36, 200);"
+            "  border: 1px solid rgba(255, 255, 255, 46);"
+            "  border-radius: 10px;"
+            "  padding: 6px 10px;"
+            "  color: #F1F5F9;"
+            "}"
+            "QComboBox QAbstractItemView {"
+            "  background-color: rgb(15, 23, 36);"
+            "  color: #F1F5F9;"
+            "  selection-background-color: rgba(56, 189, 248, 65);"
+            "}"
+        )
+        self.subject_edit = self.subject_combo.lineEdit()
+        if self.subject_edit is not None:
+            self.subject_edit.setPlaceholderText("Ders seçin veya yazın (örn. CENG201)")
+        form_row.addWidget(self.subject_combo)
 
         self.task_title_edit = QLineEdit()
-        self.task_title_edit.setPlaceholderText("Görev başlığı (örn. Türevden 30 soru çöz)")
+        self.task_title_edit.setPlaceholderText("Görev başlığı (örn. Lab 3 ödevini tamamla)")
         self.task_title_edit.returnPressed.connect(self._add_task)
         form_row.addWidget(self.task_title_edit, 1)
 
@@ -329,18 +347,30 @@ class MorningSetupWindow(QWidget):
         )
         self.proof_checkbox.setChecked(self.db.is_screenshot_proof_required())
         self.study_folder_edit.setText(self.db.get_study_folder())
+        self._refresh_courses_combo()
         self._refresh_tasks_list()
         self._refresh_apps_list()
         self._refresh_urls_list()
         self._refresh_security_status()
+
+    def _refresh_courses_combo(self) -> None:
+        current_text = self.subject_combo.currentText().strip()
+        self.subject_combo.clear()
+        for c in self.db.get_courses():
+            code = str(c["code"])
+            name = str(c["name"])
+            self.subject_combo.addItem(f"{code} — {name}", code)
+        if current_text:
+            self.subject_combo.setEditText(current_text)
 
     def _refresh_tasks_list(self) -> None:
         self.tasks_list.clear()
         tasks = self.db.get_tasks_for_date(self.logical_date)
         for idx, t in enumerate(tasks, start=1):
             est = f" ({t['estimated_minutes']} dk)" if t.get("estimated_minutes") else ""
+            proof = " [📸 Kanıtlı]" if t.get("proof_path") else ""
             status = "✓ " if t.get("completed") else "○ "
-            text = f"{status}{idx}. [{t['subject']}] {t['title']}{est}"
+            text = f"{status}{idx}. [{t['subject']}] {t['title']}{est}{proof}"
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, int(t["id"]))
             self.tasks_list.addItem(item)
@@ -355,12 +385,24 @@ class MorningSetupWindow(QWidget):
             self.requirement_lbl.setStyleSheet(f"font-size: 12px; color: {TEXT_SECONDARY};")
 
     def _add_task(self) -> None:
-        subj = self.subject_edit.text().strip() or "Genel"
+        raw_subj = self.subject_combo.currentText().strip()
+        if "—" in raw_subj:
+            subj = raw_subj.split("—", 1)[0].strip()
+        else:
+            subj = raw_subj or "Genel"
+
         title = self.task_title_edit.text().strip()
         if not title:
             return
         est = self.duration_spin.value() if self.duration_spin.value() > 0 else None
         self.db.add_task(title=title, subject=subj, estimated_minutes=est, logical_date=self.logical_date)
+
+        # Eğer yeni bir ders kodu girildiyse ders listesine de ekle ve aktif ders yap
+        known_codes = {str(c["code"]).upper() for c in self.db.get_courses()}
+        if subj.upper() not in known_codes and len(subj) <= 16:
+            self.db.add_course(subj.upper(), subj)
+        self.db.set_active_course(subj)
+
         self.task_title_edit.clear()
         self.duration_spin.setValue(0)
         self._refresh_tasks_list()
